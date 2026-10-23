@@ -762,3 +762,86 @@ tests:
       - "50"
       - "--ladder"
       - "50:2m@20,50:2m@50"
+  # Personal-assistant microVM single-actor baseline runs (async local pause vs
+  # sync durable suspend) exercising the checked-in agentsession workload through
+  # atenet request parking (--resume-mode implicit).
+  - name: agentsession_pa_light_microvm_pause
+    type: locust
+    description: "Personal Assistant Light microVM baseline: 1 session, async local pause + implicit wake"
+    targetCluster: dev
+    file: /app/tests/agentsession.py
+    duration: 4m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+    actorMemory: "256Mi"
+    actorCPU: "250m"
+    flags:
+      - "--agentsession-script"
+      - "personal-assistant-light"
+      - "--agentsession-think-scale"
+      - "0.005"
+      - "--lifecycle-mode"
+      - "async"
+      - "--resume-mode"
+      - "implicit"
+  - name: agentsession_pa_light_microvm_suspend
+    type: locust
+    description: "Personal Assistant Light microVM baseline: 1 session, sync durable GCS suspend + implicit wake"
+    targetCluster: dev
+    file: /app/tests/agentsession.py
+    duration: 4m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+    actorMemory: "256Mi"
+    actorCPU: "250m"
+    flags:
+      - "--agentsession-script"
+      - "personal-assistant-light"
+      - "--agentsession-think-scale"
+      - "0.005"
+      - "--lifecycle-mode"
+      - "sync"
+      - "--resume-mode"
+      - "implicit"
+  - name: agentsession_pa_microvm_pause
+    type: locust
+    description: "Personal Assistant full (1.5Gi) microVM baseline: 1 session, async local pause + implicit wake"
+    targetCluster: dev
+    file: /app/tests/agentsession.py
+    duration: 4m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+    actorMemory: "1536Mi"
+    actorCPU: "250m"
+    flags:
+      - "--agentsession-script"
+      - "personal-assistant"
+      - "--agentsession-think-scale"
+      - "0.005"
+      - "--lifecycle-mode"
+      - "async"
+      - "--resume-mode"
+      - "implicit"
+  - name: agentsession_pa_microvm_suspend
+    type: locust
+    description: "Personal Assistant full (1.5Gi) microVM baseline: 1 session, sync durable GCS suspend + implicit wake"
+    targetCluster: dev
+    file: /app/tests/agentsession.py
+    duration: 4m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+    actorMemory: "1536Mi"
+    actorCPU: "250m"
+    flags:
+      - "--agentsession-script"
+      - "personal-assistant"
+      - "--agentsession-think-scale"
+      - "0.005"
+      - "--lifecycle-mode"
+      - "sync"
+      - "--resume-mode"
+      - "implicit"

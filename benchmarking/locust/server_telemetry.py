@@ -596,7 +596,48 @@ ACTOR_WORKING_SET = (
 ACTOR_COUNT = "sum by (instance, exported_instance) (ate_actor_stats_sampled_actors)"
 WORKING_SET_KEYS = (*WORKING_SET_QUERIES, "actor", "per_actor")
 
+BYTES_PER_MIB = 2**20
 BYTES_PER_GIB = 2**30
+
+# Physical block devices and host NICs on nodes hosting live worker pods.
+# Excludes loopback/ramdisks and virtual pod/microVM CNI/TAP netdevs so host
+# throughput reflects backing disk (e.g. Hyperdisk) and physical NIC I/O.
+NODE_WORKER_FILTER = f"and on (instance) count by (instance) ({WORKER_PODS})"
+NODE_DISK_SELECTOR = 'container="node", device!~"/dev/(loop|ram|md|dm-).*"'
+NODE_NET_SELECTOR = (
+    'container="node", '
+    'interface!~"lo|veth.*|lxc.*|cilium.*|cali.*|flannel.*|cbr.*|cni.*|docker.*|virbr.*|tap.*|tunl.*"'
+)
+NODE_IO_QUERIES = {
+    "cpu_cores": (
+        'sum by (instance) (rate(container_cpu_usage_seconds_total{container="node"}[1m]))'
+        f" {NODE_WORKER_FILTER}"
+    ),
+    "disk_read_mib_s": (
+        f"sum by (instance) (rate(container_fs_reads_bytes_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+    "disk_write_mib_s": (
+        f"sum by (instance) (rate(container_fs_writes_bytes_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+    "disk_read_iops": (
+        f"sum by (instance) (rate(container_fs_reads_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" {NODE_WORKER_FILTER}"
+    ),
+    "disk_write_iops": (
+        f"sum by (instance) (rate(container_fs_writes_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" {NODE_WORKER_FILTER}"
+    ),
+    "net_rx_mib_s": (
+        f"sum by (instance) (rate(container_network_receive_bytes_total{{{NODE_NET_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+    "net_tx_mib_s": (
+        f"sum by (instance) (rate(container_network_transmit_bytes_total{{{NODE_NET_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+}
 
 
 def _label_key(metric: dict[str, str]) -> tuple:
@@ -697,6 +738,47 @@ def _measure_working_set(
     return out
 
 
+def _harvest_node_io(
+    prom_url: str,
+    start_ts: int,
+    end_ts: int,
+    steady_start_ts: int,
+    steady_end_ts: int,
+) -> dict[str, Any]:
+    """Host CPU cores, disk MiB/s + IOPS, and NIC MiB/s on worker nodes.
+
+    Unscraped or empty series stay null (NO_PERCENTILES, nodes=None, empty
+    timeseries), never 0, matching working_set and active_actors.
+    """
+    out: dict[str, Any] = {}
+    for key, query in NODE_IO_QUERIES.items():
+        series = _read_series(prom_url, query, start_ts, end_ts)
+        by_ts: dict[int, list[float]] = {}
+        steady_vals: list[float] = []
+        steady_nodes = 0
+        for samples in series.values():
+            in_steady = False
+            for t, val in samples.items():
+                by_ts.setdefault(t, []).append(val)
+                if steady_start_ts <= t <= steady_end_ts:
+                    steady_vals.append(val)
+                    in_steady = True
+            steady_nodes += in_steady
+        out[key] = {
+            "summary": compute_percentiles(steady_vals),
+            "nodes": steady_nodes if by_ts else None,
+            "timeseries": [
+                {
+                    "timestamp": t,
+                    "total": round(sum(v), 4),
+                    "max": round(max(v), 4),
+                }
+                for t, v in sorted(by_ts.items())
+            ],
+        }
+    return out
+
+
 # A global OOM logs no oom_memcg, so cAdvisor counts it on `/` (container="node").
 OOM_NODE = 'container="node"'
 # Kills in a worker pod: nested actor sandbox cgroups, then the worker container's.
@@ -784,6 +866,9 @@ def harvest_server_telemetry(
         ),
         "working_set": _measure_working_set(
             prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
+        ),
+        "node_io": _harvest_node_io(
+            prom_url, start_ts, end_ts, steady_start_ts, steady_end
         ),
         "oom_events": _count_oom_events(prom_url, start_ts, end_ts),
     }
@@ -892,6 +977,11 @@ def extract_and_record_server_telemetry(
         ws = working_set.get(block, {}).get("summary", {})
         for p in (*ps, "max"):
             measurements[f"working_set_{block}_{p}_gb"] = ws.get(p)
+    node_io = telemetry.get("node_io", {})
+    for key in NODE_IO_QUERIES:
+        nio = node_io.get(key, {}).get("summary", {})
+        for p in (*ps, "max"):
+            measurements[f"node_{key}_{p}"] = nio.get(p)
     oom = telemetry.get("oom_events", {})
     for key in ("node", "pod", *WORKER_POD_FIELDS):
         measurements[f"oom_events_{key}"] = oom.get(key)
