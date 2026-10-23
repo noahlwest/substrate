@@ -253,6 +253,16 @@ func TestNestedVirtualizationEnabled(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "bare-metal pool exposes hardware /dev/kvm without nested virt flag",
+			cluster: &containerpb.Cluster{
+				NodePools: []*containerpb.NodePool{
+					poolWith(proto.Bool(false)),
+					{Config: &containerpb.NodeConfig{MachineType: "c3-standard-192-metal"}},
+				},
+			},
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -353,6 +363,21 @@ func TestValidateBootDisk(t *testing.T) {
 			name:    "negative boot disk size",
 			cfg:     Config{BootDiskSizeGB: -1},
 			wantErr: "boot disk size -1 is invalid: must be greater than or equal to 0",
+		},
+		{
+			name:    "negative worker boot disk size",
+			cfg:     Config{WorkerBootDiskSizeGB: -10},
+			wantErr: "worker boot disk size -10 is invalid: must be greater than or equal to 0",
+		},
+		{
+			name:    "negative primary node count",
+			cfg:     Config{NumNodes: -2},
+			wantErr: "node count -2 is invalid: must be greater than or equal to 0",
+		},
+		{
+			name:    "negative worker node count",
+			cfg:     Config{WorkerNumNodes: -1},
+			wantErr: "worker node count -1 is invalid: must be greater than or equal to 0",
 		},
 	}
 
@@ -579,4 +604,158 @@ func TestDeleteNodePoolCommand(t *testing.T) {
 	if got != want {
 		t.Errorf("got  %q\nwant %q", got, want)
 	}
+}
+
+func TestBuildCreateClusterRequest_BareMetalAndDedicatedWorkerPool(t *testing.T) {
+	parent := "projects/test-project/locations/us-west1-a"
+
+	t.Run("single pool num-nodes override and bare-metal skips nested virt", func(t *testing.T) {
+		cfg := &Config{
+			ProjectID:                  "test-project",
+			ClusterName:                "metal-single",
+			ClusterLocation:            "us-west1-a",
+			MachineType:                "c3-standard-192-metal",
+			NumNodes:                   1,
+			BootDiskSizeGB:             2048,
+			BootDiskType:               "hyperdisk-balanced",
+			EnableNestedVirtualization: true,
+		}
+		req := buildCreateClusterRequest(parent, cfg)
+		if len(req.Cluster.NodePools) != 1 {
+			t.Fatalf("got %d node pools, want 1", len(req.Cluster.NodePools))
+		}
+		pool := req.Cluster.NodePools[0]
+		if pool.InitialNodeCount != 1 {
+			t.Errorf("InitialNodeCount = %d, want 1", pool.InitialNodeCount)
+		}
+		if pool.Config.GetAdvancedMachineFeatures() != nil {
+			t.Errorf("expected AdvancedMachineFeatures to be nil on bare-metal shape, got %+v", pool.Config.GetAdvancedMachineFeatures())
+		}
+		if !nestedVirtualizationEnabled(req.Cluster) {
+			t.Errorf("expected nestedVirtualizationEnabled() to report true for bare-metal pool")
+		}
+	})
+
+	t.Run("dedicated VM worker pool isolates KVM and taints worker nodes", func(t *testing.T) {
+		cfg := &Config{
+			ProjectID:                  "test-project",
+			ClusterName:                "bench-vm",
+			ClusterLocation:            "us-west1-a",
+			MachineType:                "n2-standard-16",
+			BootDiskSizeGB:             200,
+			BootDiskType:               "pd-balanced",
+			WorkerMachineType:                   "c3-standard-176",
+			WorkerNumNodes:                      1,
+			WorkerBootDiskSizeGB:                2048,
+			WorkerBootDiskType:                  "hyperdisk-balanced",
+			WorkerBootDiskProvisionedIOPS:       160000,
+			WorkerBootDiskProvisionedThroughput: 2400,
+			EnableNestedVirtualization:          true,
+		}
+		req := buildCreateClusterRequest(parent, cfg)
+		if len(req.Cluster.NodePools) != 2 {
+			t.Fatalf("got %d node pools, want 2", len(req.Cluster.NodePools))
+		}
+		sysPool, workerPool := req.Cluster.NodePools[0], req.Cluster.NodePools[1]
+		if sysPool.Name != "substrate-node-pool" || sysPool.InitialNodeCount != 1 {
+			t.Errorf("sysPool = (%q, %d), want (\"substrate-node-pool\", 1)", sysPool.Name, sysPool.InitialNodeCount)
+		}
+		if sysPool.Config.GetAdvancedMachineFeatures() != nil {
+			t.Errorf("expected system pool to omit nested virtualization when worker pool is dedicated")
+		}
+		if sysPool.Config.GetBootDisk() != nil {
+			t.Errorf("expected system pool BootDisk nil when unprovisioned, got %+v", sysPool.Config.GetBootDisk())
+		}
+		if len(sysPool.Config.Taints) != 0 {
+			t.Errorf("expected system pool to be untainted, got %+v", sysPool.Config.Taints)
+		}
+
+		if workerPool.Name != "benchmark-worker-pool" || workerPool.InitialNodeCount != 1 {
+			t.Errorf("workerPool = (%q, %d), want (\"benchmark-worker-pool\", 1)", workerPool.Name, workerPool.InitialNodeCount)
+		}
+		if workerPool.Config.MachineType != "c3-standard-176" {
+			t.Errorf("worker MachineType = %q, want \"c3-standard-176\"", workerPool.Config.MachineType)
+		}
+		if workerPool.Config.DiskSizeGb != 2048 || workerPool.Config.DiskType != "hyperdisk-balanced" {
+			t.Errorf("worker disk = (%d, %q), want (2048, \"hyperdisk-balanced\")", workerPool.Config.DiskSizeGb, workerPool.Config.DiskType)
+		}
+		if workerPool.Config.GetBootDisk().GetProvisionedIops() != 160000 || workerPool.Config.GetBootDisk().GetProvisionedThroughput() != 2400 {
+			t.Errorf("worker BootDisk = %+v, want (160000 IOPS, 2400 MiB/s)", workerPool.Config.GetBootDisk())
+		}
+		if !workerPool.Config.GetAdvancedMachineFeatures().GetEnableNestedVirtualization() {
+			t.Errorf("expected nested virtualization enabled on VM worker pool")
+		}
+		if len(workerPool.Config.Taints) != 1 {
+			t.Fatalf("got %d worker taints, want 1", len(workerPool.Config.Taints))
+		}
+		taint := workerPool.Config.Taints[0]
+		if taint.Key != "ate.dev/sandboxClass" || taint.Value != "shared" || taint.Effect != containerpb.NodeTaint_NO_SCHEDULE {
+			t.Errorf("unexpected worker taint: %+v", taint)
+		}
+		if !nestedVirtualizationEnabled(req.Cluster) {
+			t.Errorf("expected nestedVirtualizationEnabled() == true")
+		}
+	})
+
+	t.Run("dedicated worker pool inherits primary boot disk defaults when unset", func(t *testing.T) {
+		cfg := &Config{
+			ProjectID:                  "test-project",
+			ClusterName:                "bench-metal",
+			ClusterLocation:            "us-west1-a",
+			MachineType:                "n2-standard-16",
+			NumNodes:                   2,
+			BootDiskSizeGB:             2048,
+			BootDiskType:               "hyperdisk-balanced",
+			WorkerMachineType:          "c3-standard-192-metal",
+			WorkerNumNodes:             1,
+			EnableNestedVirtualization: true,
+		}
+		req := buildCreateClusterRequest(parent, cfg)
+		sysPool, workerPool := req.Cluster.NodePools[0], req.Cluster.NodePools[1]
+		if sysPool.InitialNodeCount != 2 {
+			t.Errorf("sysPool.InitialNodeCount = %d, want 2", sysPool.InitialNodeCount)
+		}
+		if workerPool.Config.DiskSizeGb != 2048 || workerPool.Config.DiskType != "hyperdisk-balanced" {
+			t.Errorf("worker inherited disk = (%d, %q), want (2048, \"hyperdisk-balanced\")", workerPool.Config.DiskSizeGb, workerPool.Config.DiskType)
+		}
+		if workerPool.Config.GetAdvancedMachineFeatures() != nil {
+			t.Errorf("expected nil AdvancedMachineFeatures on bare-metal worker pool")
+		}
+		if workerPool.Config.GetEphemeralStorageLocalSsdConfig() != nil {
+			t.Errorf("expected nil EphemeralStorageLocalSsdConfig on non-lssd shape")
+		}
+	})
+
+	t.Run("bundled lssd shapes auto-enable EphemeralStorageLocalSsdConfig on both VM and bare-metal", func(t *testing.T) {
+		for _, workerShape := range []string{"c4-highmem-288-lssd", "c4-highmem-288-lssd-metal", "c3-standard-176-lssd"} {
+			cfg := &Config{
+				ProjectID:                           "test-project",
+				ClusterName:                         "bench-lssd",
+				ClusterLocation:                     "us-central1-a",
+				MachineType:                         "n2-standard-32",
+				BootDiskSizeGB:                      200,
+				BootDiskType:                        "pd-balanced",
+				WorkerMachineType:                   workerShape,
+				WorkerNumNodes:                      1,
+				WorkerBootDiskSizeGB:                4096,
+				WorkerBootDiskType:                  "hyperdisk-balanced",
+				WorkerBootDiskProvisionedIOPS:       160000,
+				WorkerBootDiskProvisionedThroughput: 2400,
+				EnableNestedVirtualization:          true,
+			}
+			req := buildCreateClusterRequest("projects/test-project/locations/us-central1-a", cfg)
+			sysPool, workerPool := req.Cluster.NodePools[0], req.Cluster.NodePools[1]
+			if sysPool.Config.GetEphemeralStorageLocalSsdConfig() != nil {
+				t.Errorf("%s: expected system pool EphemeralStorageLocalSsdConfig to stay nil", workerShape)
+			}
+			if workerPool.Config.GetEphemeralStorageLocalSsdConfig() == nil {
+				t.Errorf("%s: expected worker pool EphemeralStorageLocalSsdConfig to be enabled", workerShape)
+			}
+			wantNested := !strings.HasSuffix(workerShape, "-metal")
+			gotNested := workerPool.Config.GetAdvancedMachineFeatures().GetEnableNestedVirtualization()
+			if gotNested != wantNested {
+				t.Errorf("%s: EnableNestedVirtualization = %v, want %v", workerShape, gotNested, wantNested)
+			}
+		}
+	})
 }

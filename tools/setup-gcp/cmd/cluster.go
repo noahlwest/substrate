@@ -62,6 +62,69 @@ func deleteCluster(ctx context.Context, cfg *Config) error {
 	return waitContainerOperation(ctx, client, op.Name, cfg)
 }
 
+const benchmarkWorkerPoolTaintKey = "ate.dev/sandboxClass"
+const benchmarkWorkerPoolTaintVal = "shared"
+
+// isBareMetalMachineType reports whether machineType names a GCE bare-metal
+// instance (e.g. "c3-standard-192-metal"). Bare-metal instances expose hardware
+// /dev/kvm directly and GKE rejects EnableNestedVirtualization on them.
+func isBareMetalMachineType(machineType string) bool {
+	return strings.HasSuffix(strings.TrimSpace(machineType), "-metal")
+}
+
+// isBundledLocalSSDMachineType reports whether machineType bundles dedicated
+// NVMe Local SSD partitions (e.g. "c4-highmem-288-lssd",
+// "c4-highmem-288-lssd-metal", "z3-highmem-192-highlssd-metal"). Without
+// EphemeralStorageLocalSsdConfig set on NodeConfig, GKE leaves bundled NVMe
+// drives unused for kubelet ephemeral storage (/var/lib/containerd).
+func isBundledLocalSSDMachineType(machineType string) bool {
+	mt := strings.TrimSpace(machineType)
+	return strings.HasSuffix(mt, "lssd") || strings.HasSuffix(mt, "lssd-metal")
+}
+
+func effectiveNodeCount(configured, fallback int32) int32 {
+	if configured > 0 {
+		return configured
+	}
+	return fallback
+}
+
+func buildNodeConfig(machineType string, diskSizeGB int32, diskType string, provisionedIOPS, provisionedThroughput int64, ephemeralLocalSSD, enableNestedVirt bool, taints []*containerpb.NodeTaint) *containerpb.NodeConfig {
+	nodeConfig := &containerpb.NodeConfig{
+		MachineType: machineType,
+		LinuxNodeConfig: &containerpb.LinuxNodeConfig{
+			Sysctls: maps.Clone(requiredNodeSysctls),
+		},
+		Taints: taints,
+	}
+	if enableNestedVirt {
+		if isBareMetalMachineType(machineType) {
+			slog.Info("Skipping nested virtualization on bare-metal machine type; /dev/kvm is exposed natively",
+				slog.String("machineType", machineType))
+		} else {
+			nodeConfig.AdvancedMachineFeatures = &containerpb.AdvancedMachineFeatures{
+				EnableNestedVirtualization: proto.Bool(true),
+			}
+		}
+	}
+	if diskSizeGB > 0 {
+		nodeConfig.DiskSizeGb = diskSizeGB
+	}
+	if diskType != "" {
+		nodeConfig.DiskType = diskType
+	}
+	if provisionedIOPS > 0 || provisionedThroughput > 0 {
+		nodeConfig.BootDisk = &containerpb.BootDisk{
+			ProvisionedIops:       provisionedIOPS,
+			ProvisionedThroughput: provisionedThroughput,
+		}
+	}
+	if ephemeralLocalSSD || isBundledLocalSSDMachineType(machineType) {
+		nodeConfig.EphemeralStorageLocalSsdConfig = &containerpb.EphemeralStorageLocalSsdConfig{}
+	}
+	return nodeConfig
+}
+
 func buildCreateClusterRequest(parent string, cfg *Config) *containerpb.CreateClusterRequest {
 	var networkConfig *containerpb.NetworkConfig
 	if cfg.EnableDataplaneV2 {
@@ -69,35 +132,90 @@ func buildCreateClusterRequest(parent string, cfg *Config) *containerpb.CreateCl
 			DatapathProvider: containerpb.DatapathProvider_ADVANCED_DATAPATH,
 		}
 	}
-	nodeConfig := &containerpb.NodeConfig{
-		MachineType: cfg.MachineType,
-		LinuxNodeConfig: &containerpb.LinuxNodeConfig{
-			Sysctls: maps.Clone(requiredNodeSysctls),
-		},
-	}
-	if cfg.EnableNestedVirtualization {
-		nodeConfig.AdvancedMachineFeatures = &containerpb.AdvancedMachineFeatures{
-			EnableNestedVirtualization: proto.Bool(true),
+	hasDedicatedWorkerPool := strings.TrimSpace(cfg.WorkerMachineType) != ""
+	var pools []*containerpb.NodePool
+	if hasDedicatedWorkerPool {
+		// System / load-generator pool stays untainted without KVM so control-plane
+		// pods and load generators run isolated from the benchmark worker node.
+		systemNodeConfig := buildNodeConfig(
+			cfg.MachineType,
+			cfg.BootDiskSizeGB,
+			cfg.BootDiskType,
+			cfg.BootDiskProvisionedIOPS,
+			cfg.BootDiskProvisionedThroughput,
+			cfg.EphemeralStorageLocalSSD,
+			false,
+			nil,
+		)
+		workerDiskSize := cfg.WorkerBootDiskSizeGB
+		if workerDiskSize == 0 {
+			workerDiskSize = cfg.BootDiskSizeGB
 		}
-	}
-	if cfg.BootDiskSizeGB > 0 {
-		nodeConfig.DiskSizeGb = cfg.BootDiskSizeGB
-	}
-	if cfg.BootDiskType != "" {
-		nodeConfig.DiskType = cfg.BootDiskType
+		workerDiskType := cfg.WorkerBootDiskType
+		if workerDiskType == "" {
+			workerDiskType = cfg.BootDiskType
+		}
+		workerIOPS := cfg.WorkerBootDiskProvisionedIOPS
+		if workerIOPS == 0 {
+			workerIOPS = cfg.BootDiskProvisionedIOPS
+		}
+		workerThroughput := cfg.WorkerBootDiskProvisionedThroughput
+		if workerThroughput == 0 {
+			workerThroughput = cfg.BootDiskProvisionedThroughput
+		}
+		workerNodeConfig := buildNodeConfig(
+			strings.TrimSpace(cfg.WorkerMachineType),
+			workerDiskSize,
+			workerDiskType,
+			workerIOPS,
+			workerThroughput,
+			cfg.WorkerEphemeralStorageLocalSSD || cfg.EphemeralStorageLocalSSD,
+			cfg.EnableNestedVirtualization,
+			[]*containerpb.NodeTaint{
+				{
+					Key:    benchmarkWorkerPoolTaintKey,
+					Value:  benchmarkWorkerPoolTaintVal,
+					Effect: containerpb.NodeTaint_NO_SCHEDULE,
+				},
+			},
+		)
+		pools = []*containerpb.NodePool{
+			{
+				Name:             "substrate-node-pool",
+				InitialNodeCount: effectiveNodeCount(cfg.NumNodes, 1),
+				Config:           systemNodeConfig,
+			},
+			{
+				Name:             "benchmark-worker-pool",
+				InitialNodeCount: effectiveNodeCount(cfg.WorkerNumNodes, 1),
+				Config:           workerNodeConfig,
+			},
+		}
+	} else {
+		nodeConfig := buildNodeConfig(
+			cfg.MachineType,
+			cfg.BootDiskSizeGB,
+			cfg.BootDiskType,
+			cfg.BootDiskProvisionedIOPS,
+			cfg.BootDiskProvisionedThroughput,
+			cfg.EphemeralStorageLocalSSD,
+			cfg.EnableNestedVirtualization,
+			nil,
+		)
+		pools = []*containerpb.NodePool{
+			{
+				Name:             "substrate-node-pool",
+				InitialNodeCount: effectiveNodeCount(cfg.NumNodes, 2),
+				Config:           nodeConfig,
+			},
+		}
 	}
 	return &containerpb.CreateClusterRequest{
 		Parent: parent,
 		Cluster: &containerpb.Cluster{
 			Name:                  cfg.ClusterName,
 			InitialClusterVersion: cfg.ClusterVersion,
-			NodePools: []*containerpb.NodePool{
-				{
-					Name:             "substrate-node-pool",
-					InitialNodeCount: 2,
-					Config:           nodeConfig,
-				},
-			},
+			NodePools:             pools,
 			EnableK8SBetaApis: &containerpb.K8SBetaAPIConfig{
 				EnabledApis: requiredBetaAPIs,
 			},
@@ -124,6 +242,9 @@ func buildCreateClusterRequest(parent string, cfg *Config) *containerpb.CreateCl
 func nestedVirtualizationEnabled(cluster *containerpb.Cluster) bool {
 	for _, pool := range cluster.GetNodePools() {
 		if pool.GetConfig().GetAdvancedMachineFeatures().GetEnableNestedVirtualization() {
+			return true
+		}
+		if isBareMetalMachineType(pool.GetConfig().GetMachineType()) {
 			return true
 		}
 	}
@@ -474,10 +595,31 @@ func containsAll(clusterAPIs []string, requiredAPIs []string) bool {
 	return true
 }
 
-// validateBootDisk ensures BootDiskSizeGB is non-negative.
+// validateBootDisk ensures disk sizes, provisioned IOPS/throughput, and node counts are non-negative.
 func validateBootDisk(cfg *Config) error {
 	if cfg.BootDiskSizeGB < 0 {
 		return fmt.Errorf("boot disk size %d is invalid: must be greater than or equal to 0", cfg.BootDiskSizeGB)
+	}
+	if cfg.WorkerBootDiskSizeGB < 0 {
+		return fmt.Errorf("worker boot disk size %d is invalid: must be greater than or equal to 0", cfg.WorkerBootDiskSizeGB)
+	}
+	if cfg.BootDiskProvisionedIOPS < 0 {
+		return fmt.Errorf("boot disk provisioned IOPS %d is invalid: must be greater than or equal to 0", cfg.BootDiskProvisionedIOPS)
+	}
+	if cfg.BootDiskProvisionedThroughput < 0 {
+		return fmt.Errorf("boot disk provisioned throughput %d is invalid: must be greater than or equal to 0", cfg.BootDiskProvisionedThroughput)
+	}
+	if cfg.WorkerBootDiskProvisionedIOPS < 0 {
+		return fmt.Errorf("worker boot disk provisioned IOPS %d is invalid: must be greater than or equal to 0", cfg.WorkerBootDiskProvisionedIOPS)
+	}
+	if cfg.WorkerBootDiskProvisionedThroughput < 0 {
+		return fmt.Errorf("worker boot disk provisioned throughput %d is invalid: must be greater than or equal to 0", cfg.WorkerBootDiskProvisionedThroughput)
+	}
+	if cfg.NumNodes < 0 {
+		return fmt.Errorf("node count %d is invalid: must be greater than or equal to 0", cfg.NumNodes)
+	}
+	if cfg.WorkerNumNodes < 0 {
+		return fmt.Errorf("worker node count %d is invalid: must be greater than or equal to 0", cfg.WorkerNumNodes)
 	}
 	return nil
 }
@@ -521,9 +663,20 @@ func init() {
 	clusterCmd.Flags().StringVar(&cfg.ClusterVersion, "version", getEnv("CLUSTER_VERSION", ""), "Kubernetes version [env: CLUSTER_VERSION]")
 	clusterCmd.Flags().StringVar(&cfg.Network, "network", getEnv("NETWORK", "default"), "VPC network name [env: NETWORK]")
 	clusterCmd.Flags().StringVar(&cfg.Subnetwork, "subnetwork", getEnv("SUBNETWORK", "default"), "VPC subnetwork name [env: SUBNETWORK]")
-	clusterCmd.Flags().StringVar(&cfg.MachineType, "machine-type", resolveMachineTypeDefault(), "Machine type for the node pool [env: NODE_MACHINE_TYPE]")
+	clusterCmd.Flags().StringVar(&cfg.MachineType, "machine-type", resolveMachineTypeDefault(), "Machine type for the primary/system node pool [env: NODE_MACHINE_TYPE]")
+	clusterCmd.Flags().Int32Var(&cfg.NumNodes, "num-nodes", getEnv("NUM_NODES", int32(0)), "Node count for the primary/system node pool; 0 defaults to 2 (or 1 when --worker-machine-type is set) [env: NUM_NODES]")
 	clusterCmd.Flags().BoolVar(&cfg.EnableDataplaneV2, "enable-dataplane-v2", getEnv("ENABLE_DATAPLANE_V2", true), "Enable Dataplane V2 [env: ENABLE_DATAPLANE_V2]")
-	clusterCmd.Flags().BoolVar(&cfg.EnableNestedVirtualization, "enable-nested-virtualization", getEnv("ENABLE_NESTED_VIRTUALIZATION", true), "Create the node pool with nested virtualization, exposing /dev/kvm for micro-VM workers; needs a machine type that supports it. Turn off with --enable-nested-virtualization=false [env: ENABLE_NESTED_VIRTUALIZATION]")
+	clusterCmd.Flags().BoolVar(&cfg.EnableNestedVirtualization, "enable-nested-virtualization", getEnv("ENABLE_NESTED_VIRTUALIZATION", true), "Create the worker node pool with nested virtualization, exposing /dev/kvm for micro-VM workers; automatically skipped on *-metal bare-metal shapes. Turn off with --enable-nested-virtualization=false [env: ENABLE_NESTED_VIRTUALIZATION]")
 	clusterCmd.Flags().Int32Var(&cfg.BootDiskSizeGB, "boot-disk-size", getEnv("BOOT_DISK_SIZE_GB", int32(0)), "Boot disk size in GB for the node pool; 0 = GKE default (100 GB) [env: BOOT_DISK_SIZE_GB]")
 	clusterCmd.Flags().StringVar(&cfg.BootDiskType, "boot-disk-type", getEnv("BOOT_DISK_TYPE", ""), "Boot disk type for the node pool; empty = GKE default [env: BOOT_DISK_TYPE]")
+	clusterCmd.Flags().Int64Var(&cfg.BootDiskProvisionedIOPS, "boot-disk-provisioned-iops", getEnv("BOOT_DISK_PROVISIONED_IOPS", int64(0)), "Provisioned IOPS for Hyperdisk-Balanced boot disk; 0 = GKE baseline default [env: BOOT_DISK_PROVISIONED_IOPS]")
+	clusterCmd.Flags().Int64Var(&cfg.BootDiskProvisionedThroughput, "boot-disk-provisioned-throughput", getEnv("BOOT_DISK_PROVISIONED_THROUGHPUT", int64(0)), "Provisioned throughput in MiB/s for Hyperdisk-Balanced boot disk; 0 = GKE baseline default [env: BOOT_DISK_PROVISIONED_THROUGHPUT]")
+	clusterCmd.Flags().BoolVar(&cfg.EphemeralStorageLocalSSD, "ephemeral-storage-local-ssd", getEnv("EPHEMERAL_STORAGE_LOCAL_SSD", false), "Back node kubelet ephemeral storage (/var/lib/containerd) with RAID-0 NVMe Local SSDs; auto-enabled on *lssd and *lssd-metal machine types [env: EPHEMERAL_STORAGE_LOCAL_SSD]")
+	clusterCmd.Flags().StringVar(&cfg.WorkerMachineType, "worker-machine-type", getEnv("WORKER_MACHINE_TYPE", ""), "Optional dedicated benchmark worker node pool machine type (tainted ate.dev/sandboxClass=shared:NoSchedule) [env: WORKER_MACHINE_TYPE]")
+	clusterCmd.Flags().Int32Var(&cfg.WorkerNumNodes, "worker-num-nodes", getEnv("WORKER_NUM_NODES", int32(1)), "Node count for the dedicated benchmark worker node pool [env: WORKER_NUM_NODES]")
+	clusterCmd.Flags().Int32Var(&cfg.WorkerBootDiskSizeGB, "worker-boot-disk-size", getEnv("WORKER_BOOT_DISK_SIZE_GB", int32(0)), "Boot disk size in GB for the dedicated worker node pool; 0 inherits --boot-disk-size [env: WORKER_BOOT_DISK_SIZE_GB]")
+	clusterCmd.Flags().StringVar(&cfg.WorkerBootDiskType, "worker-boot-disk-type", getEnv("WORKER_BOOT_DISK_TYPE", ""), "Boot disk type for the dedicated worker node pool; empty inherits --boot-disk-type [env: WORKER_BOOT_DISK_TYPE]")
+	clusterCmd.Flags().Int64Var(&cfg.WorkerBootDiskProvisionedIOPS, "worker-boot-disk-provisioned-iops", getEnv("WORKER_BOOT_DISK_PROVISIONED_IOPS", int64(0)), "Provisioned IOPS for the dedicated worker node pool Hyperdisk-Balanced boot disk; 0 inherits --boot-disk-provisioned-iops [env: WORKER_BOOT_DISK_PROVISIONED_IOPS]")
+	clusterCmd.Flags().Int64Var(&cfg.WorkerBootDiskProvisionedThroughput, "worker-boot-disk-provisioned-throughput", getEnv("WORKER_BOOT_DISK_PROVISIONED_THROUGHPUT", int64(0)), "Provisioned throughput in MiB/s for the dedicated worker node pool Hyperdisk-Balanced boot disk; 0 inherits --boot-disk-provisioned-throughput [env: WORKER_BOOT_DISK_PROVISIONED_THROUGHPUT]")
+	clusterCmd.Flags().BoolVar(&cfg.WorkerEphemeralStorageLocalSSD, "worker-ephemeral-storage-local-ssd", getEnv("WORKER_EPHEMERAL_STORAGE_LOCAL_SSD", false), "Back dedicated worker pool kubelet ephemeral storage with RAID-0 NVMe Local SSDs; auto-enabled on *lssd and *lssd-metal machine types [env: WORKER_EPHEMERAL_STORAGE_LOCAL_SSD]")
 }

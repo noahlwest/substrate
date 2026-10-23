@@ -37,12 +37,24 @@ type Config struct {
 	Subnetwork        string
 	EnableDataplaneV2 bool
 
-	NodePoolName               string
-	NodePoolVersion            string
-	MachineType                string
-	EnableNestedVirtualization bool
-	BootDiskSizeGB             int32
-	BootDiskType               string
+	NodePoolName                  string
+	NodePoolVersion               string
+	MachineType                   string
+	NumNodes                      int32
+	EnableNestedVirtualization    bool
+	BootDiskSizeGB                int32
+	BootDiskType                  string
+	BootDiskProvisionedIOPS       int64
+	BootDiskProvisionedThroughput int64
+	EphemeralStorageLocalSSD      bool
+
+	WorkerMachineType                   string
+	WorkerNumNodes                      int32
+	WorkerBootDiskSizeGB                int32
+	WorkerBootDiskType                  string
+	WorkerBootDiskProvisionedIOPS       int64
+	WorkerBootDiskProvisionedThroughput int64
+	WorkerEphemeralStorageLocalSSD      bool
 
 	BucketName string
 
