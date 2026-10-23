@@ -16,12 +16,45 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"go.ate.dev/substrate/pkg/objectstorage"
 	appsv1 "k8s.io/api/apps/v1"
 	"sigs.k8s.io/yaml"
 )
+
+func TestResolveUploadCapacityAndAutoBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		flagVal  string
+		memTotal int64
+		want     int64
+	}{
+		{name: "auto unknown memTotal falls back to 512Mi", flagVal: "auto", memTotal: 0, want: objectstorage.DefaultUploadMemory},
+		{name: "auto small 2Gi node clamps to 512Mi", flagVal: "auto", memTotal: 2 << 30, want: objectstorage.DefaultUploadMemory},
+		{name: "auto c3-standard-8 32Gi node scales to 20% (6.4Gi)", flagVal: "auto", memTotal: 32 << 30, want: (32 << 30) / 5},
+		{name: "auto c4-highmem-288 2232Gi node clamps at 128Gi", flagVal: "auto", memTotal: 2232 << 30, want: MaxAutoUploadMemory},
+		{name: "explicit quantity overrides auto", flagVal: "512Mi", memTotal: 2232 << 30, want: 512 << 20},
+		{name: "explicit 16Gi quantity", flagVal: "16Gi", memTotal: 32 << 30, want: 16 << 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveUploadCapacity(tc.flagVal, tc.memTotal)
+			if err != nil || got != tc.want {
+				t.Fatalf("resolveUploadCapacity(%q, %d) = %d, %v; want %d", tc.flagVal, tc.memTotal, got, err, tc.want)
+			}
+		})
+	}
+
+	tmp := filepath.Join(t.TempDir(), "meminfo")
+	if err := os.WriteFile(tmp, []byte("MemTotal:       33554432 kB\nMemFree:        1000000 kB\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := readHostMemTotalBytes(tmp), int64(32<<30); got != want {
+		t.Fatalf("readHostMemTotalBytes() = %d, want %d", got, want)
+	}
+}
 
 func TestParseCapacity(t *testing.T) {
 	for _, tc := range []struct {

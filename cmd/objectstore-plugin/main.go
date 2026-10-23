@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,7 +53,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-const usage = `usage: objectstore-plugin <node|control|healthcheck> [flags]`
+const (
+	usage = `usage: objectstore-plugin <node|control|healthcheck> [flags]`
+
+	// MaxAutoUploadMemory caps the automatic upload memory budget (20% of host
+	// MemTotal) at 128 GiB on multi-terabyte worker nodes.
+	MaxAutoUploadMemory int64 = 128 << 30
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -63,7 +70,7 @@ func main() {
 	flags := pflag.NewFlagSet(mode, pflag.ExitOnError)
 	socket := flags.String("socket", "", "Unix socket to serve on, or to check in healthcheck mode")
 	root := flags.String("root", nodepath.BasePath, "node mode: the only directory tree local snapshot and asset files may be read from or written to")
-	uploadMemory := flags.String("upload-memory-budget", resource.NewQuantity(objectstorage.DefaultUploadMemory, resource.BinarySI).String(), "node mode: shared memory reservations for snapshot compression and upload buffers, as a Kubernetes quantity; uploads wait for capacity")
+	uploadMemory := flags.String("upload-memory-budget", "auto", "node mode: shared memory reservations for snapshot compression and upload buffers, as a Kubernetes quantity or 'auto' (clamp(20% of host MemTotal, 512Mi, 128Gi)); uploads wait for capacity")
 	assetStagingDir := flags.String("asset-staging-dir", "/var/lib/objectstore-plugin/asset-staging", "node mode: directory sandbox assets are downloaded into and verified before they are copied below --root; must not be below --root or readable by the caller")
 	assetStagingCapacity := flags.String("asset-staging-capacity", "8Gi", "node mode: the most sandbox asset downloads in --asset-staging-dir may hold at once, as a Kubernetes quantity; downloads wait for space, and an asset larger than this is refused")
 	timeout := flags.Duration("timeout", 5*time.Second, "healthcheck mode: how long to wait for the plugin to report that it is serving")
@@ -121,10 +128,11 @@ func main() {
 		if err != nil {
 			serverboot.Fatal(ctx, "Failed to set up the object storage backend", err)
 		}
-		uploadCapacity, err := parseCapacity(*uploadMemory)
+		uploadCapacity, err := resolveUploadCapacity(*uploadMemory, readHostMemTotalBytes("/proc/meminfo"))
 		if err != nil {
 			serverboot.Fatal(ctx, "Invalid --upload-memory-budget", err)
 		}
+		slog.InfoContext(ctx, "Configured upload memory budget", slog.Int64("upload_memory_budget_bytes", uploadCapacity), slog.String("flag", *uploadMemory))
 		// On GCS every transfer runs on a token scoped to its actor, from the
 		// exchange. S3 has no per-actor credential and keeps the pod's own.
 		var nodeOpts []objectstoreplugin.NodeOption
@@ -255,4 +263,51 @@ func parseCapacity(s string) (int64, error) {
 		return 0, fmt.Errorf("%q is not a positive whole number of bytes", s)
 	}
 	return n, nil
+}
+
+// defaultUploadMemoryBudget computes clamp(20% * memTotalBytes, 512Mi, 128Gi),
+// falling back to objectstorage.DefaultUploadMemory (512Mi) when memTotalBytes <= 0.
+func defaultUploadMemoryBudget(memTotalBytes int64) int64 {
+	budget := memTotalBytes / 5
+	if budget < objectstorage.DefaultUploadMemory {
+		return objectstorage.DefaultUploadMemory
+	}
+	if budget > MaxAutoUploadMemory {
+		return MaxAutoUploadMemory
+	}
+	return budget
+}
+
+// resolveUploadCapacity resolves a Kubernetes quantity string or "auto" into a
+// positive byte count.
+func resolveUploadCapacity(flagValue string, memTotalBytes int64) (int64, error) {
+	if strings.EqualFold(strings.TrimSpace(flagValue), "auto") {
+		return defaultUploadMemoryBudget(memTotalBytes), nil
+	}
+	return parseCapacity(flagValue)
+}
+
+// readHostMemTotalBytes parses MemTotal (in kB) from /proc/meminfo, returning 0
+// if the file cannot be read or parsed.
+func readHostMemTotalBytes(procMeminfoPath string) int64 {
+	raw, err := os.ReadFile(procMeminfoPath)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "MemTotal:")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return 0
+		}
+		kb, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil || kb <= 0 {
+			return 0
+		}
+		return kb * 1024
+	}
+	return 0
 }

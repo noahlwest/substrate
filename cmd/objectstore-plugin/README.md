@@ -74,7 +74,8 @@ the repository cannot, since they are under `internal/`.
 ## Upload memory
 
 The node plugin shares one upload memory budget across all snapshot requests.
-`--upload-memory-budget` accepts a Kubernetes quantity and defaults to `512Mi`.
+`--upload-memory-budget` accepts a Kubernetes quantity or `auto` (the default,
+which clamps 20% of host `MemTotal` between `512Mi` and `128Gi`).
 Uploads wait before allocating compressor or backend buffers. Waiting requests
 cancel with their RPC, and failed uploads release their reservations after their
 compression and upload workers stop.

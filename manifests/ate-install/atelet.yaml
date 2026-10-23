@@ -170,6 +170,10 @@ spec:
         # reserves its object's size; ones past the capacity wait their turn,
         # so the asset-staging volume below never fills up.
         - --asset-staging-capacity=8Gi
+        # Auto-size concurrent snapshot upload memory budget as
+        # clamp(20% of host MemTotal, 512Mi, 128Gi) so small nodes stay bounded
+        # while high-memory worker nodes parallelize snapshot uploads.
+        - --upload-memory-budget=auto
         # The plugin listens on a Unix socket, which a gRPC probe cannot
         # reach, and the image has no shell, so the binary checks itself.
         startupProbe:
