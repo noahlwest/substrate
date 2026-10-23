@@ -64,3 +64,15 @@ func TestActorDirs(t *testing.T) {
 	checkSubdirs("root_dir", actorDirs.GetRootDir(), underActorRoot)
 	checkSubdirs("snapshot_root", snapshotRoot, underSnapshotRoot)
 }
+
+func TestExternalVolumeHostTargetPath(t *testing.T) {
+	if got, want := ExternalVolumeHostTargetPath("u1", "v1", ""), "/var/lib/ate/actors/u1/volumes/v1"; got != want {
+		t.Fatalf("empty hostBasePath = %q, want %q", got, want)
+	}
+	if got, want := ExternalVolumeHostTargetPath("u1", "v1", "/var/lib/ate"), "/var/lib/ate/actors/u1/volumes/v1"; got != want {
+		t.Fatalf("default hostBasePath = %q, want %q", got, want)
+	}
+	if got, want := ExternalVolumeHostTargetPath("u1", "v1", "/var/lib/kubelet/ate"), "/var/lib/kubelet/ate/actors/u1/volumes/v1"; got != want {
+		t.Fatalf("custom hostBasePath = %q, want %q", got, want)
+	}
+}

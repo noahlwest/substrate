@@ -248,6 +248,7 @@ spec:
         - --drain-delay=0s
         - --drain-timeout=5m
         - --objectstore-plugin-socket=/run/objectstore-plugin/node.sock
+        - --node-base-host-path=/var/lib/kubelet/ate
         # atelet does no mounts, netlink, device, or namespace operations (those
         # live in the worker pod) — it only reads/writes the
         # /var/lib/ate hostPath as root. CAP_DAC_OVERRIDE is for one thing:
@@ -355,7 +356,7 @@ spec:
           sizeLimit: 9Gi
       - name: ate-base
         hostPath:
-          path: /var/lib/ate
+          path: /var/lib/kubelet/ate
           type: DirectoryOrCreate
       # Mount Kubelet plugins directory to access CSI driver Unix domain sockets.
       - name: kubelet-plugins

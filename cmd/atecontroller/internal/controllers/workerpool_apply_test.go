@@ -1168,3 +1168,36 @@ func TestBuildDeploymentPreview(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDeploymentApplyConfigCustomNodeBaseHostPath(t *testing.T) {
+	customPath := "/var/lib/kubelet/ate"
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty defaults to BasePath", in: "", want: nodepath.BasePath},
+		{name: "custom NVMe hostPath", in: customPath, want: customPath},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := buildDeploymentApplyConfigWithHostPath(
+				testWorkerPoolApplyConfig(nil),
+				workerOTelSettings{},
+				installdefaults.SystemNamespace,
+				installdefaults.AteletServiceAccount,
+				installdefaults.RouterServiceAccount,
+				egresspolicy.DNSEgressPolicyEnforceInAtunnel,
+				tc.in,
+			).Spec.Template.Spec
+			var got string
+			for _, vol := range ps.Volumes {
+				if vol.Name != nil && *vol.Name == "ate-base" && vol.HostPath != nil && vol.HostPath.Path != nil {
+					got = *vol.HostPath.Path
+				}
+			}
+			if got != tc.want {
+				t.Fatalf("ate-base hostPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

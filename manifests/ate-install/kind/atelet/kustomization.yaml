@@ -52,6 +52,10 @@ patches:
               - mountPath: /run/image-credential-provider/config.yaml
                 $patch: delete
             volumes:
+            - name: ate-base
+              hostPath:
+                path: /var/lib/ate
+                type: DirectoryOrCreate
             - name: image-credential-provider-bin
               $patch: delete
             - name: image-credential-provider-config

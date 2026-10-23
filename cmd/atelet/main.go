@@ -114,6 +114,7 @@ var (
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
+	nodeBaseHostPath             = pflag.String("node-base-host-path", nodepath.BasePath, "Host directory backing atelet's /var/lib/ate volume mount, used when sending external CSI volume mount targets to host-namespace CSI node plugins.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
@@ -713,6 +714,7 @@ type Atelet struct {
 	// snapshotScratchDir holds short-lived manifest directories; it must be
 	// inside the node plugin's root.
 	snapshotScratchDir    string
+	nodeBaseHostPath      string
 	instruments           *Instruments
 	mu                    sync.RWMutex
 	volumePlugins         map[string]volume.VolumePluginWorkerPlane
@@ -785,6 +787,7 @@ func NewService(
 		assetPlugin:           assetPlugin,
 		pluginSocket:          pluginSocket,
 		snapshotScratchDir:    ateletpath.SnapshotScratchDir,
+		nodeBaseHostPath:      *nodeBaseHostPath,
 		instruments:           instruments,
 		volumePlugins:         volumePlugins,
 		csiDriverConfigGetter: csiDriverConfigGetter,

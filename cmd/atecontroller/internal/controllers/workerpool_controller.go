@@ -89,6 +89,9 @@ type WorkerPoolReconciler struct {
 	RouterServiceAccount string
 	// DNSEgressPolicy is the --dns-egress-policy mode propagated to worker pods.
 	DNSEgressPolicy string
+	// NodeBaseHostPath is the node hostPath backing worker pods' /var/lib/ate
+	// mount. Empty defaults to nodepath.BasePath (/var/lib/ate).
+	NodeBaseHostPath string
 	// Recorder emits a Normal event each time a pool's SandboxConfig
 	// changes, and a Warning event when a class stops resolving.
 	Recorder events.EventRecorder
@@ -331,7 +334,7 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1.Wo
 			return err
 		}
 	}
-	depAC := buildDeploymentApplyConfig(wp, workerOTelSettings{
+	depAC := buildDeploymentApplyConfigWithHostPath(wp, workerOTelSettings{
 		Endpoint:             r.OTelEndpoint,
 		MetricExportInterval: r.OTelMetricExportInterval,
 		MetricExportTimeout:  r.OTelMetricExportTimeout,
@@ -340,7 +343,7 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1.Wo
 		LogsExporter:         r.OTelLogsExporter,
 		TracesExporter:       r.OTelTracesExporter,
 		MetricsExporter:      r.OTelMetricsExporter,
-	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount, r.DNSEgressPolicy)
+	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount, r.DNSEgressPolicy, r.NodeBaseHostPath)
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}

@@ -40,10 +40,11 @@ func (s *Atelet) mountExternalVolumes(ctx context.Context, actorUID string, volu
 		if ext == nil {
 			continue
 		}
-		hostPath := ateletpath.ExternalVolumeHostPath(actorUID, vol.GetName())
-		if err := os.MkdirAll(hostPath, 0o750); err != nil {
-			return fmt.Errorf("failed to create mount point %q: %w", hostPath, err)
+		containerPath := ateletpath.ExternalVolumeHostPath(actorUID, vol.GetName())
+		if err := os.MkdirAll(containerPath, 0o750); err != nil {
+			return fmt.Errorf("failed to create mount point %q: %w", containerPath, err)
 		}
+		hostPath := ateletpath.ExternalVolumeHostTargetPath(actorUID, vol.GetName(), s.nodeBaseHostPath)
 		slog.InfoContext(ctx, "Mounting volume", slog.String("volume_id", ext.GetStorageVolumeId()), slog.String("host_path", hostPath), slog.String("volume_type", ext.GetVolumeType()))
 		plugin, err := s.getPlugin(ctx, ext.GetVolumeType())
 		if err != nil {
@@ -73,7 +74,7 @@ func (s *Atelet) unmountExternalVolumes(ctx context.Context, actorUID string, vo
 		if ext == nil {
 			continue
 		}
-		hostPath := ateletpath.ExternalVolumeHostPath(actorUID, vol.GetName())
+		hostPath := ateletpath.ExternalVolumeHostTargetPath(actorUID, vol.GetName(), s.nodeBaseHostPath)
 		slog.InfoContext(ctx, "Unmounting volume", slog.String("volume_id", ext.GetStorageVolumeId()), slog.String("host_path", hostPath), slog.String("volume_type", ext.GetVolumeType()))
 		// TODO: Standardize volume plugin lookup and error handling across control plane
 		// and worker plane (e.g. via a shared helper).

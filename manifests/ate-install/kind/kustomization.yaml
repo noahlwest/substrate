@@ -37,3 +37,21 @@ resources:
   - rustfs.yaml
   - ./otel-collector.yaml
   - ./prometheus.yaml
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ate-controller
+        namespace: ate-system
+      spec:
+        template:
+          spec:
+            containers:
+            - name: ate-controller
+              args:
+              - --ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem
+              - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+              - --dns-egress-policy=enforce-in-atunnel
+              - --node-base-host-path=/var/lib/ate

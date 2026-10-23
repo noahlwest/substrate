@@ -106,6 +106,7 @@ spec:
         - --ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem
         - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
         - --dns-egress-policy=enforce-in-atunnel
+        - --node-base-host-path=/var/lib/kubelet/ate
         env:
         - name: POD_NAME
           valueFrom:

@@ -18,6 +18,7 @@ package ateletpath
 
 import (
 	"path/filepath"
+	"strings"
 
 	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
@@ -238,6 +239,23 @@ func ExternalVolumeHostPath(actorUID, volumeName string) string {
 		ExternalVolumeMountsDir(actorUID),
 		volumeName,
 	)
+}
+
+// ExternalVolumeHostTargetPath returns the path on the host filesystem where an
+// external CSI node plugin (running in the host mount namespace) should mount
+// or unmount the volume so it appears at ExternalVolumeHostPath inside atelet
+// and worker containers. When hostBasePath is empty or equal to
+// nodepath.BasePath, it returns ExternalVolumeHostPath unchanged.
+func ExternalVolumeHostTargetPath(actorUID, volumeName, hostBasePath string) string {
+	containerPath := ExternalVolumeHostPath(actorUID, volumeName)
+	if hostBasePath == "" || hostBasePath == nodepath.BasePath {
+		return containerPath
+	}
+	rel, err := filepath.Rel(nodepath.BasePath, containerPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return containerPath
+	}
+	return filepath.Join(hostBasePath, rel)
 }
 
 // ActorDirs is the directory set atelet passes to worker for an actor. worker

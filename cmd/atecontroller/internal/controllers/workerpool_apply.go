@@ -109,6 +109,13 @@ const (
 // are declared here. otel is propagated to the worker container (see
 // workerContainerEnv).
 func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string) *appsv1ac.DeploymentApplyConfiguration {
+	return buildDeploymentApplyConfigWithHostPath(wp, otel, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy, nodepath.BasePath)
+}
+
+func buildDeploymentApplyConfigWithHostPath(wp *atev1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy, nodeBaseHostPath string) *appsv1ac.DeploymentApplyConfiguration {
+	if nodeBaseHostPath == "" {
+		nodeBaseHostPath = nodepath.BasePath
+	}
 	labels := map[string]string{}
 	annotations := map[string]string{}
 	if wp.Spec.Template != nil {
@@ -224,7 +231,7 @@ func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, s
 			corev1ac.Volume().
 				WithName("ate-base").
 				WithHostPath(corev1ac.HostPathVolumeSource().
-					WithPath(nodepath.BasePath).
+					WithPath(nodeBaseHostPath).
 					WithType(corev1.HostPathDirectoryOrCreate)),
 			corev1ac.Volume().
 				WithName(atunnelIdentityVolume).
