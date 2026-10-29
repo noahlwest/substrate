@@ -926,6 +926,13 @@ actually did, independent of what the load generator reported.
   `--actor-stats-poll-interval` (default 1m), so these move in steps of a
   minute or more. `actor` matches one worker pod's actors only when the node
   runs one worker pod.
+* `node_io.cpu_cores`, `disk_read_mib_s`, `disk_write_mib_s`, `disk_read_iops`,
+  `disk_write_iops`, `net_rx_mib_s`, `net_tx_mib_s`: worker-node CPU cores,
+  whole-disk throughput and IOPS (`/dev/nvme*n*`, `/dev/sd*`, `/dev/vd*`), and
+  host NIC throughput (excluding loopback, CNI, tunnel, and TAP interfaces),
+  with the same `{summary, count, timeseries}` shape as `working_set` (`total`
+  and `max` in the metric's unit). Flattened in `stats.jsonl` as
+  `node_<metric>_<stat>`.
 * `oom_events.node`, `pod`: OOM kills over the run, from cAdvisor's
   `container_oom_events_total`. `node` counts only global OOMs. `pod` counts
   kills inside a worker pod (actor sandboxes and the worker container) and is
@@ -967,7 +974,8 @@ working set points back by the same amount. The window ends at the last
 full-load sample, so teardown suspends are left out.
 
 `metadata.start_ts` and `end_ts` bound the whole run, which the packing,
-`active_actors` and `working_set` timeseries cover. `steady_start_ts` and
+`active_actors`, `working_set`, and `node_io` timeseries cover.
+`steady_start_ts` and
 `steady_end_ts` bound the steady-state window. A flat subset of the numbers
 also goes into a `server_summary` row in `stats.jsonl`.
 

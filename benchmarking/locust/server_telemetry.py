@@ -16,7 +16,8 @@
 
 Queries Prometheus over [T_start, T_end] and the steady-state window inside it
 to capture cluster packing, node and pod PSI stalls, snapshot sizes, latencies
-and throughput, running actors, memory working set and OOM kills.
+and throughput, running actors, memory working set, worker-node CPU, disk, and
+network rates, and OOM kills.
 """
 
 import csv
@@ -569,11 +570,13 @@ WORKER_PODS = (
     '{namespace="benchmark-workloads", container="worker"}[1m]) > 0'
 )
 
+NODE_WORKER_FILTER = f"and on (instance) count by (instance) ({WORKER_PODS})"
+
 # Only nodes/pods with a live worker; max, not sum: a restart briefly has 2 series.
 WORKING_SET_QUERIES = {
     "node": (
         'max by (instance) (container_memory_working_set_bytes{container="node"})'
-        f" and on (instance) count by (instance) ({WORKER_PODS})"
+        f" {NODE_WORKER_FILTER}"
     ),
     "worker": (
         "max by (pod) (container_memory_working_set_bytes"
@@ -583,7 +586,7 @@ WORKING_SET_QUERIES = {
     "atelet": (
         "max by (pod, instance) (container_memory_working_set_bytes"
         '{namespace="ate-system", container="atelet"})'
-        f" and on (instance) count by (instance) ({WORKER_PODS})"
+        f" {NODE_WORKER_FILTER}"
     ),
 }
 
@@ -596,7 +599,48 @@ ACTOR_WORKING_SET = (
 ACTOR_COUNT = "sum by (instance, exported_instance) (ate_actor_stats_sampled_actors)"
 WORKING_SET_KEYS = (*WORKING_SET_QUERIES, "actor", "per_actor")
 
+BYTES_PER_MIB = 2**20
 BYTES_PER_GIB = 2**30
+
+# Whole block devices only: on the root cgroup, cAdvisor also emits
+# container_fs_{reads,writes}_total per mounted partition (/dev/nvme0n1p1,
+# /dev/sda1) and virtual device (loop, ram, md, dm), which would double-count
+# IOPS against whole-disk blkio counters.
+NODE_DISK_SELECTOR = 'container="node", device=~"/dev/(nvme[0-9]+n[0-9]+|[sv]d[a-z]+)"'
+NODE_NET_SELECTOR = (
+    'container="node", '
+    'interface!~"lo|veth.*|gke.*|ptp.*|lxc.*|cilium.*|cali.*|flannel.*|cbr.*|cni.*|docker.*|virbr.*|tap.*|tunl.*|genev.*|vxlan.*|kube.*|nodelocaldns|wg.*"'
+)
+NODE_IO_QUERIES = {
+    "cpu_cores": (
+        'sum by (instance) (rate(container_cpu_usage_seconds_total{container="node"}[1m]))'
+        f" {NODE_WORKER_FILTER}"
+    ),
+    "disk_read_mib_s": (
+        f"sum by (instance) (rate(container_fs_reads_bytes_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+    "disk_write_mib_s": (
+        f"sum by (instance) (rate(container_fs_writes_bytes_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+    "disk_read_iops": (
+        f"sum by (instance) (rate(container_fs_reads_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" {NODE_WORKER_FILTER}"
+    ),
+    "disk_write_iops": (
+        f"sum by (instance) (rate(container_fs_writes_total{{{NODE_DISK_SELECTOR}}}[1m]))"
+        f" {NODE_WORKER_FILTER}"
+    ),
+    "net_rx_mib_s": (
+        f"sum by (instance) (rate(container_network_receive_bytes_total{{{NODE_NET_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+    "net_tx_mib_s": (
+        f"sum by (instance) (rate(container_network_transmit_bytes_total{{{NODE_NET_SELECTOR}}}[1m]))"
+        f" / {BYTES_PER_MIB} {NODE_WORKER_FILTER}"
+    ),
+}
 
 
 def _label_key(metric: dict[str, str]) -> tuple:
@@ -626,32 +670,35 @@ def _read_series(
     return out
 
 
-def _summarize_gb(
+def _summarize_series(
     series: dict[Any, dict[int, float]],
     steady_start_ts: int,
     steady_end_ts: int,
+    *,
+    scale: float = 1.0,
+    unit: str = "",
 ) -> dict[str, Any]:
     """Steady percentiles, series seen in steady, and a 10s sum/max timeseries."""
     by_ts: dict[int, list[float]] = {}
-    steady_gb: list[float] = []
+    steady_vals: list[float] = []
     steady_series = 0
     for samples in series.values():
         in_steady = False
         for t, val in samples.items():
-            gb = val / BYTES_PER_GIB
-            by_ts.setdefault(t, []).append(gb)
+            scaled = val * scale
+            by_ts.setdefault(t, []).append(scaled)
             if steady_start_ts <= t <= steady_end_ts:
-                steady_gb.append(gb)
+                steady_vals.append(scaled)
                 in_steady = True
         steady_series += in_steady
     return {
-        "summary": compute_percentiles(steady_gb),
+        "summary": compute_percentiles(steady_vals),
         "count": steady_series if by_ts else None,
         "timeseries": [
             {
                 "timestamp": t,
-                "total_gb": round(sum(v), 4),
-                "max_gb": round(max(v), 4),
+                f"total{unit}": round(sum(v), 4),
+                f"max{unit}": round(max(v), 4),
             }
             for t, v in sorted(by_ts.items())
         ],
@@ -674,7 +721,9 @@ def _measure_working_set(
     both are read `lag_s // 2` late and moved back onto the run's 10s grid.
     """
     def summarize(series: dict[Any, dict[int, float]]) -> dict[str, Any]:
-        return _summarize_gb(series, steady_start_ts, steady_end_ts)
+        return _summarize_series(
+            series, steady_start_ts, steady_end_ts, scale=1.0 / BYTES_PER_GIB, unit="_gb"
+        )
 
     out: dict[str, Any] = {
         key: summarize(_read_series(prom_url, query, start_ts, end_ts))
@@ -695,6 +744,24 @@ def _measure_working_set(
         for key, samples in actor.items()
     })
     return out
+
+
+def _harvest_node_io(
+    prom_url: str,
+    start_ts: int,
+    end_ts: int,
+    steady_start_ts: int,
+    steady_end_ts: int,
+) -> dict[str, Any]:
+    """Worker-node CPU cores, disk MiB/s and IOPS, and network MiB/s."""
+    return {
+        key: _summarize_series(
+            _read_series(prom_url, query, start_ts, end_ts),
+            steady_start_ts,
+            steady_end_ts,
+        )
+        for key, query in NODE_IO_QUERIES.items()
+    }
 
 
 # A global OOM logs no oom_memcg, so cAdvisor counts it on `/` (container="node").
@@ -763,7 +830,8 @@ def harvest_server_telemetry(
 
     Only the atelet-exported snapshot, active actor and actor working set
     blocks are read late, by `lag_s // 2`; packing, PSI, the cAdvisor working
-    set and OOM counts aren't shifted and are read over the run window as is.
+    set, host I/O, and OOM counts aren't shifted and are read over the run
+    window as is.
     """
     steady_end = end_ts if steady_end_ts is None else steady_end_ts
     return {
@@ -784,6 +852,9 @@ def harvest_server_telemetry(
         ),
         "working_set": _measure_working_set(
             prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
+        ),
+        "node_io": _harvest_node_io(
+            prom_url, start_ts, end_ts, steady_start_ts, steady_end
         ),
         "oom_events": _count_oom_events(prom_url, start_ts, end_ts),
     }
@@ -892,6 +963,11 @@ def extract_and_record_server_telemetry(
         ws = working_set.get(block, {}).get("summary", {})
         for p in (*ps, "max"):
             measurements[f"working_set_{block}_{p}_gb"] = ws.get(p)
+    node_io = telemetry.get("node_io", {})
+    for key in NODE_IO_QUERIES:
+        nio = node_io.get(key, {}).get("summary", {})
+        for p in (*ps, "max"):
+            measurements[f"node_{key}_{p}"] = nio.get(p)
     oom = telemetry.get("oom_events", {})
     for key in ("node", "pod", *WORKER_POD_FIELDS):
         measurements[f"oom_events_{key}"] = oom.get(key)

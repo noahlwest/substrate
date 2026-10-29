@@ -40,8 +40,8 @@ WINDOW = {"prom_url": "http://localhost:9090", "start_ts": 100,
           "end_ts": 105, "steady_start_ts": 100}
 
 
-def ranges(packing, node=(), pod=(), active=(), ws=(), actor_ws=()):
-    """A query_prometheus_range fake: packing, PSI, active actors, working set.
+def ranges(packing, node=(), pod=(), active=(), ws=(), actor_ws=(), node_io=()):
+    """A query_prometheus_range fake: packing, PSI, active actors, working set, node I/O.
 
     Pod PSI only answers the pod-slice selector, so a query that loses the id
     regex (and would also sum the pause container) gets nothing back. Node PSI
@@ -50,6 +50,7 @@ def ranges(packing, node=(), pod=(), active=(), ws=(), actor_ws=()):
     pod_slice = ('{pod=~"benchmark-worker.*", container="", '
                  'id=~".*[/-]pod[^/]+(\\\\.slice)?"}')
     worker_nodes = "and on (instance) sum by (instance) (rate("
+    node_io_queries = set(server_telemetry.NODE_IO_QUERIES.values())
 
     def fake(_url, query, *_args, **_kwargs):
         if "ate_workerpool_workers" in query:
@@ -58,6 +59,8 @@ def ranges(packing, node=(), pod=(), active=(), ws=(), actor_ws=()):
             return list(active)
         if "ate_actor_stats_memory_working_set_bytes" in query:
             return list(actor_ws)
+        if query in node_io_queries:
+            return list(node_io)
         # Before the PSI branch: the node working set query has container="node".
         if "container_memory_working_set_bytes" in query:
             return list(ws)
@@ -257,7 +260,9 @@ class ServerTelemetryTest(unittest.TestCase):
             ws=[{"metric": {"instance": "node-a"},
                  "values": [[100, str(2**30)], [105, str(2**30)]]}],
             actor_ws=[{"metric": {"instance": "atelet-a"},
-                       "values": [[135, str(6 * 2**30)]]}])
+                       "values": [[135, str(6 * 2**30)]]}],
+            node_io=[{"metric": {"instance": "node-a"},
+                      "values": [[100, "12.5"], [105, "25.0"]]}])
         # The default 70s lag reads the snapshot window at 135 and 140.
         mock_instant.side_effect = snapshot_prom(
             "11.5",
@@ -300,7 +305,7 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual(
             set(summary),
             {"metadata", "cluster_packing", "node_psi", "pod_psi", "snapshots",
-             "active_actors", "working_set", "oom_events"},
+             "active_actors", "working_set", "node_io", "oom_events"},
         )
         packing = summary["cluster_packing"]
         self.assertEqual(packing["summary"]["p50"], 0.8)  # 3 + 1 busy / 5 workers
@@ -320,7 +325,7 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual(row["metric"], "server_summary")
         m = row["measurements"]
         # Every source answered, so a key wired to a wrong name would read None.
-        self.assertEqual(len(m), 80)
+        self.assertEqual(len(m), 115)
         self.assertEqual([k for k, v in m.items() if v is None], [])
         # Every value a string, so one row's types match every other row's.
         self.assertTrue(all(isinstance(v, str) for v in m.values()))
@@ -332,6 +337,9 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual(m["restore_mean_s"], "0.5")
         self.assertEqual(m["checkpoint_mean_s"], "2.0")
         self.assertEqual(m["active_actors_p99"], "3.0")
+        self.assertEqual(m["node_disk_read_mib_s_p50"], "25.0")
+        self.assertEqual(m["node_disk_write_iops_max"], "25.0")
+        self.assertEqual(m["node_cpu_cores_p99"], "25.0")
         # Read at 135, moved back to 100; 6 GiB over the 3 actors on atelet-a.
         actor = summary["working_set"]["actor"]
         self.assertEqual(actor["timeseries"][0]["timestamp"], 100)
@@ -807,6 +815,33 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual(calls, ["telemetry", ("ladder", "unit-run_logs.txt", "http://x:9090")])
         self.assertIn("Failed to summarize ladder steps: prometheus down", out.getvalue())
         self.assertTrue(upload.called)
+
+    def test_node_disk_selector_and_monitoring_rules(self):
+        dm = re.search(r'device=~"([^"]+)"', server_telemetry.NODE_DISK_SELECTOR)
+        self.assertIsNotNone(dm)
+        whole_disk = re.compile(f"^(?:{dm.group(1)})$")
+        for disk in ("/dev/nvme0n1", "/dev/nvme47n1", "/dev/sda", "/dev/vda"):
+            self.assertRegex(disk, whole_disk)
+        for excluded in (
+            "/dev/nvme0n1p1",
+            "/dev/sda1",
+            "/dev/vda15",
+            "/dev/loop0",
+            "/dev/ram0",
+            "/dev/zram0",
+            "/dev/md0",
+            "/dev/dm-0",
+        ):
+            self.assertNotRegex(excluded, whole_disk)
+
+        monitoring_text = (
+            Path(__file__).resolve().parents[2] / "monitoring.yaml"
+        ).read_text()
+        keep = re.search(r"action:\s*keep\s*\n\s*regex:\s*(container_\S+)", monitoring_text)
+        self.assertIsNotNone(keep)
+        for metric_name in ("container_fs_reads_total", "container_fs_writes_total"):
+            self.assertRegex(metric_name, f"^(?:{keep.group(1)})$")
+        self.assertIn("regex: container_fs_(reads|writes)_total;/.+", monitoring_text)
 
 
 if __name__ == "__main__":
